@@ -8,7 +8,7 @@ set -e
 # Configuration
 APPLICATION_NAME="todo-manager"
 ENVIRONMENT="dev"
-AWS_REGION="us-west-2"
+AWS_REGION="us-east-1"
 INFRA_STACK_NAME="${APPLICATION_NAME}-${ENVIRONMENT}-infra"
 SERVICE_STACK_NAME="${APPLICATION_NAME}-${ENVIRONMENT}-service"
 IMAGE_TAG=v1
@@ -132,7 +132,7 @@ build_application() {
         exit 1
     fi
     
-    ./mvnw clean package -DskipTests
+    mvn clean package -DskipTests
     
     if [ $? -eq 0 ]; then
         print_success "Application built successfully"
@@ -170,13 +170,10 @@ build_and_push_image() {
     fi
     
     # Tag the image
-    
-    finch tag $APPLICATION_NAME:latest $ECR_URI:latest
     finch tag $APPLICATION_NAME:latest $ECR_URI:$IMAGE_TAG
     
     # Push the image
     print_status "Pushing finch image to ECR..."
-    finch push $ECR_URI:latest
     finch push $ECR_URI:$IMAGE_TAG
     
     if [ $? -eq 0 ]; then
@@ -430,7 +427,7 @@ main() {
     # Step 2: Build application
     if [ "$BUILD_APP" = true ]; then
         build_application
-        create_finchfile
+        #create_finchfile
     fi
     
     # Step 3: Build and push finch image
