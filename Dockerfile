@@ -37,7 +37,7 @@ USER todoapp
 EXPOSE 8080
 
 # Environment variables with defaults
-ENV SPRING_PROFILES_ACTIVE=dev
+#ENV SPRING_PROFILES_ACTIVE=dev
 ENV SERVER_PORT=8080
 ENV JAVA_OPTS="-Xmx512m -Xms256m"
 

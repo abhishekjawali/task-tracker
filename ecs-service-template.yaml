@@ -1,0 +1,138 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECS Service template for ToDo Manager Spring Boot application'
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: todo-manager
+    Description: Name of the application
+  
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+  
+  ContainerPort:
+    Type: Number
+    Default: 8080
+    Description: Port on which the application runs
+  
+  DesiredCount:
+    Type: Number
+    Default: 2
+    Description: Number of tasks to run
+  
+  TaskCpu:
+    Type: String
+    Default: '512'
+    AllowedValues: ['256', '512', '1024', '2048', '4096']
+    Description: CPU units for the task
+  
+  TaskMemory:
+    Type: String
+    Default: '1024'
+    AllowedValues: ['512', '1024', '2048', '3072', '4096', '5120', '6144', '7168', '8192']
+    Description: Memory for the task
+
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: Docker image tag to deploy
+
+Resources:
+  # ECS Task Definition
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ApplicationName}-${Environment}'
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: 
+        Fn::ImportValue: !Sub '${ApplicationName}-${Environment}-ecs-execution-role'
+      TaskRoleArn: 
+        Fn::ImportValue: !Sub '${ApplicationName}-${Environment}-ecs-task-role'
+      ContainerDefinitions:
+        - Name: !Sub '${ApplicationName}-container'
+          Image: !Sub 
+            - '${ECRUri}:${ImageTag}'
+            - ECRUri: 
+                Fn::ImportValue: !Sub '${ApplicationName}-${Environment}-ecr-uri'
+              ImageTag: !Ref ImageTag
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          Environment:
+            - Name: SPRING_PROFILES_ACTIVE
+              Value: prod
+            - Name: SERVER_PORT
+              Value: !Ref ContainerPort
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: 
+                Fn::ImportValue: !Sub '${ApplicationName}-${Environment}-log-group'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Essential: true
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub 'curl -f http://localhost:${ContainerPort}/actuator/health || exit 1'
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-task-definition'
+
+  # ECS Service
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub '${ApplicationName}-${Environment}-service'
+      Cluster: 
+        Fn::ImportValue: !Sub '${ApplicationName}-${Environment}-ecs-cluster'
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - Fn::ImportValue: !Sub '${ApplicationName}-${Environment}-ecs-security-group'
+          Subnets: !Split
+            - ','
+            - Fn::ImportValue: !Sub '${ApplicationName}-${Environment}-private-subnets'
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: !Sub '${ApplicationName}-container'
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: 
+            Fn::ImportValue: !Sub '${ApplicationName}-${Environment}-alb-target-group'
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      HealthCheckGracePeriodSeconds: 120
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-service'
+
+Outputs:
+  ECSServiceName:
+    Description: ECS Service name
+    Value: !GetAtt ECSService.Name
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-ecs-service'
+
+  TaskDefinitionArn:
+    Description: Task Definition ARN
+    Value: !Ref TaskDefinition
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-task-definition'
