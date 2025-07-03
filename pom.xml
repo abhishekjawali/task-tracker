@@ -10,9 +10,9 @@
     </parent>
     <groupId>com.example</groupId>
     <artifactId>todo-app</artifactId>
-    <version>0.0.1-SNAPSHOT</version>
+    <version>1</version>
     <name>todo-app</name>
-    <description>Spring Boot ToDo Application</description>
+    <description>ToDo Tracker</description>
     
     <properties>
         <java.version>11</java.version>
