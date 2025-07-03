@@ -1,17 +1,17 @@
 #!/bin/bash
 
-# ToDo Manager ECS Deployment Script - FIXED VERSION
-# This script deploys infrastructure first, then builds and pushes the image, then deploys ECS service
+# Comprehensive ECS Deployment Script for Spring Boot ToDo Application
+# Supports two-phase CloudFormation deployment to avoid chicken-and-egg problems
 
-set -e
+set -e  # Exit on any error
 
 # Configuration
-APPLICATION_NAME="todo-manager"
+PROJECT_NAME="todo-app"
 ENVIRONMENT="dev"
 AWS_REGION="us-east-1"
-INFRA_STACK_NAME="${APPLICATION_NAME}-${ENVIRONMENT}-infra"
-SERVICE_STACK_NAME="${APPLICATION_NAME}-${ENVIRONMENT}-service"
-IMAGE_TAG=v1
+INFRASTRUCTURE_STACK_NAME="${PROJECT_NAME}-${ENVIRONMENT}-infrastructure"
+SERVICE_STACK_NAME="${PROJECT_NAME}-${ENVIRONMENT}-service"
+IMAGE_TAG="v1"
 
 # Colors for output
 RED='\033[0;31m'
@@ -37,252 +37,286 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# Function to check if AWS CLI is installed and configured
-check_aws_cli() {
+# Function to show usage
+show_usage() {
+    cat << EOF
+Usage: $0 [OPTIONS]
+
+Deploy Spring Boot ToDo Application to AWS ECS using CloudFormation
+
+OPTIONS:
+    --infrastructure-only    Deploy only infrastructure stack (Phase 1)
+    --service-only          Deploy only ECS service stack (Phase 3)
+    --app-only              Build image and deploy/update service only
+    --setup-git             Configure CodeCommit integration
+    --full-deploy           Complete deployment (all phases)
+    --update                Update existing deployment
+    --cleanup               Delete all resources
+    --status                Check deployment status
+    
+    --project-name NAME     Project name (default: todo-app)
+    --environment ENV       Environment (default: dev)
+    --region REGION         AWS region (default: us-east-1)
+    --image-tag TAG         finch image tag (default: latest)
+    
+    --help                  Show this help message
+
+EXAMPLES:
+    # Full deployment (recommended for first time)
+    $0 --full-deploy
+    
+    # Deploy only infrastructure
+    $0 --infrastructure-only
+    
+    # Update application code only
+    $0 --app-only
+    
+    # Setup CodeCommit integration
+    $0 --setup-git
+    
+    # Check deployment status
+    $0 --status
+
+DEPLOYMENT PHASES:
+    Phase 1: Deploy infrastructure (VPC, ECR, ALB, ECS cluster)
+    Phase 2: Build and push finch image to ECR
+    Phase 3: Deploy ECS service and task definition
+
+EOF
+}
+
+# Function to check prerequisites
+check_prerequisites() {
+    print_status "Checking prerequisites..."
+    
+    # Check AWS CLI
     if ! command -v aws &> /dev/null; then
         print_error "AWS CLI is not installed. Please install it first."
         exit 1
     fi
     
-    if ! aws sts get-caller-identity &> /dev/null; then
-        print_error "AWS CLI is not configured. Please run 'aws configure' first."
+    # Check finch
+    if ! command -v finch &> /dev/null; then
+        print_error "finch is not installed. Please install it first."
         exit 1
     fi
     
-    print_success "AWS CLI is configured"
+    # Check Maven
+    if ! command -v mvn &> /dev/null; then
+        print_error "Maven is not installed. Please install it first."
+        exit 1
+    fi
+    
+    # Check AWS credentials
+    if ! aws sts get-caller-identity &> /dev/null; then
+        print_error "AWS credentials not configured. Please run 'aws configure'."
+        exit 1
+    fi
+    
+    # Check finch daemon
+    if ! finch info &> /dev/null; then
+        print_error "finch daemon is not running. Please start finch."
+        exit 1
+    fi
+    
+    print_success "All prerequisites met"
 }
 
-# Function to check if finch is running
-check_finch() {
-    if ! command -v finch &> /dev/null; then
-        print_error "finch is not installed. Please install finch first."
-        exit 1
-    fi
+# Function to get AWS account ID
+get_account_id() {
+    aws sts get-caller-identity --query Account --output text
+}
+
+# Function to check if stack exists
+stack_exists() {
+    local stack_name=$1
+    aws cloudformation describe-stacks --stack-name "$stack_name" --region "$AWS_REGION" &> /dev/null
+}
+
+# Function to wait for stack operation
+wait_for_stack() {
+    local stack_name=$1
+    local operation=$2
     
-    if ! finch info &> /dev/null; then
-        print_error "finch is not running. Please start finch first."
-        exit 1
-    fi
+    print_status "Waiting for stack $operation to complete: $stack_name"
     
-    print_success "finch is running"
+    aws cloudformation wait "stack-${operation}-complete" \
+        --stack-name "$stack_name" \
+        --region "$AWS_REGION" || {
+        print_error "Stack $operation failed for: $stack_name"
+        
+        # Show stack events for debugging
+        print_status "Recent stack events:"
+        aws cloudformation describe-stack-events \
+            --stack-name "$stack_name" \
+            --region "$AWS_REGION" \
+            --query 'StackEvents[0:10].[Timestamp,ResourceStatus,ResourceType,LogicalResourceId,ResourceStatusReason]' \
+            --output table
+        
+        exit 1
+    }
+    
+    print_success "Stack $operation completed: $stack_name"
 }
 
 # Function to deploy infrastructure stack
 deploy_infrastructure() {
-    print_status "Deploying infrastructure CloudFormation stack..."
+    print_status "Deploying infrastructure stack..."
     
-    aws cloudformation deploy \
-        --template-file infrastructure-template.yaml \
-        --stack-name $INFRA_STACK_NAME \
-        --parameter-overrides \
-            ApplicationName=$APPLICATION_NAME \
-            Environment=$ENVIRONMENT \
-        --capabilities CAPABILITY_NAMED_IAM \
-        --region $AWS_REGION
-    
-    if [ $? -eq 0 ]; then
-        print_success "Infrastructure stack deployed successfully"
+    if stack_exists "$INFRASTRUCTURE_STACK_NAME"; then
+        print_status "Updating existing infrastructure stack..."
+        aws cloudformation update-stack \
+            --stack-name "$INFRASTRUCTURE_STACK_NAME" \
+            --template-body file://infrastructure-template.yaml \
+            --parameters ParameterKey=ProjectName,ParameterValue="$PROJECT_NAME" \
+                        ParameterKey=Environment,ParameterValue="$ENVIRONMENT" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --region "$AWS_REGION" || {
+            if [[ $? -eq 255 ]]; then
+                print_warning "No updates to be performed on infrastructure stack"
+                return 0
+            else
+                print_error "Failed to update infrastructure stack"
+                exit 1
+            fi
+        }
+        wait_for_stack "$INFRASTRUCTURE_STACK_NAME" "update"
     else
-        print_error "Failed to deploy infrastructure stack"
-        exit 1
+        print_status "Creating new infrastructure stack..."
+        aws cloudformation create-stack \
+            --stack-name "$INFRASTRUCTURE_STACK_NAME" \
+            --template-body file://infrastructure-template.yaml \
+            --parameters ParameterKey=ProjectName,ParameterValue="$PROJECT_NAME" \
+                        ParameterKey=Environment,ParameterValue="$ENVIRONMENT" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --region "$AWS_REGION"
+        wait_for_stack "$INFRASTRUCTURE_STACK_NAME" "create"
     fi
-}
-
-# Function to get infrastructure stack outputs
-get_infra_outputs() {
-    print_status "Getting infrastructure stack outputs..."
     
+    # Get ECR repository URI
     ECR_URI=$(aws cloudformation describe-stacks \
-        --stack-name $INFRA_STACK_NAME \
-        --region $AWS_REGION \
+        --stack-name "$INFRASTRUCTURE_STACK_NAME" \
+        --region "$AWS_REGION" \
         --query 'Stacks[0].Outputs[?OutputKey==`ECRRepositoryURI`].OutputValue' \
         --output text)
     
-    ALB_URL=$(aws cloudformation describe-stacks \
-        --stack-name $INFRA_STACK_NAME \
-        --region $AWS_REGION \
-        --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerURL`].OutputValue' \
-        --output text)
-    
-    ECS_CLUSTER=$(aws cloudformation describe-stacks \
-        --stack-name $INFRA_STACK_NAME \
-        --region $AWS_REGION \
-        --query 'Stacks[0].Outputs[?OutputKey==`ECSClusterName`].OutputValue' \
-        --output text)
-    
-    CODECOMMIT_URL=$(aws cloudformation describe-stacks \
-        --stack-name $INFRA_STACK_NAME \
-        --region $AWS_REGION \
-        --query 'Stacks[0].Outputs[?OutputKey==`CodeCommitRepositoryCloneUrlHttp`].OutputValue' \
-        --output text)
-    
-    print_success "Retrieved infrastructure outputs"
-    echo "ECR URI: $ECR_URI"
-    echo "ALB URL: $ALB_URL"
-    echo "ECS Cluster: $ECS_CLUSTER"
-    echo "CodeCommit URL: $CODECOMMIT_URL"
-}
-
-# Function to build the application
-build_application() {
-    print_status "Building Spring Boot application..."
-    
-    if [ ! -f "pom.xml" ]; then
-        print_error "pom.xml not found. Make sure you're in the project root directory."
-        exit 1
-    fi
-    
-    mvn clean package -DskipTests
-    
-    if [ $? -eq 0 ]; then
-        print_success "Application built successfully"
-    else
-        print_error "Failed to build application"
-        exit 1
-    fi
-}
-
-# Function to create finchfile if it doesn't exist
-create_finchfile() {
-    if [ ! -f "finchfile" ]; then
-        print_status "finchfile not found, but it should exist. Please check the project structure."
-        exit 1
-    else
-        print_status "Using existing finchfile"
-    fi
+    print_success "Infrastructure deployed successfully"
+    print_status "ECR Repository: $ECR_URI"
 }
 
 # Function to build and push finch image
 build_and_push_image() {
+    print_status "Building and pushing finch image..."
+    
+    # Get ECR repository URI from CloudFormation output
+    ECR_URI=$(aws cloudformation describe-stacks \
+        --stack-name "$INFRASTRUCTURE_STACK_NAME" \
+        --region "$AWS_REGION" \
+        --query 'Stacks[0].Outputs[?OutputKey==`ECRRepositoryURI`].OutputValue' \
+        --output text)
+    
+    if [[ -z "$ECR_URI" ]]; then
+        print_error "Could not get ECR repository URI. Make sure infrastructure is deployed."
+        exit 1
+    fi
+    
+    # Build Maven project
+    print_status "Building Maven project..."
+    mvn clean package -DskipTests
+    
+    # Build finch image
     print_status "Building finch image..."
+    finch build --platform linux/amd64 -t "${PROJECT_NAME}:${IMAGE_TAG}" .
     
-    # Get ECR login token
-    aws ecr get-login-password --region $AWS_REGION --profile "$AWS_PROFILE" | finch login --username AWS --password-stdin $ECR_URI
+    # Tag image for ECR
+    finch tag "${PROJECT_NAME}:${IMAGE_TAG}" "${ECR_URI}:${IMAGE_TAG}"
     
-    # Build the image
-    finch build --platform linux/amd64 -t $APPLICATION_NAME:latest .
+    # Login to ECR
+    print_status "Logging in to ECR..."
+    aws ecr get-login-password --region "$AWS_REGION" | \
+        finch login --username AWS --password-stdin "$ECR_URI"
     
-    if [ $? -eq 0 ]; then
-        print_success "finch image built successfully"
-    else
-        print_error "Failed to build finch image"
-        exit 1
-    fi
+    # Push image to ECR
+    print_status "Pushing image to ECR..."
+    finch push "${ECR_URI}:${IMAGE_TAG}"
     
-    # Tag the image
-    finch tag $APPLICATION_NAME:latest $ECR_URI:$IMAGE_TAG
-    
-    # Push the image
-    print_status "Pushing finch image to ECR..."
-    finch push $ECR_URI:$IMAGE_TAG
-    
-    if [ $? -eq 0 ]; then
-        print_success "finch image pushed successfully"
-        echo "Image tags: latest, $IMAGE_TAG"
-    else
-        print_error "Failed to push finch image"
-        exit 1
-    fi
+    print_success "Image built and pushed successfully"
+    print_status "Image URI: ${ECR_URI}:${IMAGE_TAG}"
 }
 
 # Function to deploy ECS service
-deploy_ecs_service() {
-    print_status "Deploying ECS service CloudFormation stack..."
+deploy_service() {
+    print_status "Deploying ECS service..."
     
-    aws cloudformation deploy \
-        --template-file ecs-service-template.yaml \
-        --stack-name $SERVICE_STACK_NAME \
-        --parameter-overrides \
-            ApplicationName=$APPLICATION_NAME \
-            Environment=$ENVIRONMENT \
-            ImageTag=$IMAGE_TAG \
-        --region $AWS_REGION
-    
-    if [ $? -eq 0 ]; then
-        print_success "ECS service stack deployed successfully"
+    if stack_exists "$SERVICE_STACK_NAME"; then
+        print_status "Updating existing service stack..."
+        aws cloudformation update-stack \
+            --stack-name "$SERVICE_STACK_NAME" \
+            --template-body file://ecs-service-template.yaml \
+            --parameters ParameterKey=ProjectName,ParameterValue="$PROJECT_NAME" \
+                        ParameterKey=Environment,ParameterValue="$ENVIRONMENT" \
+                        ParameterKey=ImageTag,ParameterValue="$IMAGE_TAG" \
+            --capabilities CAPABILITY_IAM \
+            --region "$AWS_REGION" || {
+            if [[ $? -eq 255 ]]; then
+                print_warning "No updates to be performed on service stack"
+                return 0
+            else
+                print_error "Failed to update service stack"
+                exit 1
+            fi
+        }
+        wait_for_stack "$SERVICE_STACK_NAME" "update"
     else
-        print_error "Failed to deploy ECS service stack"
-        exit 1
+        print_status "Creating new service stack..."
+        aws cloudformation create-stack \
+            --stack-name "$SERVICE_STACK_NAME" \
+            --template-body file://ecs-service-template.yaml \
+            --parameters ParameterKey=ProjectName,ParameterValue="$PROJECT_NAME" \
+                        ParameterKey=Environment,ParameterValue="$ENVIRONMENT" \
+                        ParameterKey=ImageTag,ParameterValue="$IMAGE_TAG" \
+            --capabilities CAPABILITY_IAM \
+            --region "$AWS_REGION"
+        wait_for_stack "$SERVICE_STACK_NAME" "create"
     fi
+    
+    print_success "ECS service deployed successfully"
 }
 
-# Function to get service stack outputs
-get_service_outputs() {
-    print_status "Getting service stack outputs..."
+# Function to setup CodeCommit integration
+setup_git() {
+    print_status "Setting up CodeCommit integration..."
     
-    ECS_SERVICE=$(aws cloudformation describe-stacks \
-        --stack-name $SERVICE_STACK_NAME \
-        --region $AWS_REGION \
-        --query 'Stacks[0].Outputs[?OutputKey==`ECSServiceName`].OutputValue' \
+    # Get CodeCommit repository URL
+    CODECOMMIT_URL=$(aws cloudformation describe-stacks \
+        --stack-name "$INFRASTRUCTURE_STACK_NAME" \
+        --region "$AWS_REGION" \
+        --query 'Stacks[0].Outputs[?OutputKey==`CodeCommitRepositoryCloneUrlHttp`].OutputValue' \
         --output text)
     
-    print_success "Retrieved service outputs"
-    echo "ECS Service: $ECS_SERVICE"
-}
-
-# Function to wait for service to be stable
-wait_for_service() {
-    print_status "Waiting for ECS service to become stable..."
-    
-    aws ecs wait services-stable \
-        --cluster $ECS_CLUSTER \
-        --services $ECS_SERVICE \
-        --region $AWS_REGION
-    
-    if [ $? -eq 0 ]; then
-        print_success "ECS service is stable and running"
-    else
-        print_warning "Service may still be starting up. Check the AWS console for status."
+    if [[ -z "$CODECOMMIT_URL" ]]; then
+        print_error "Could not get CodeCommit repository URL. Make sure infrastructure is deployed."
+        exit 1
     fi
-}
-
-# Function to show deployment status
-show_deployment_status() {
-    print_status "Deployment Status:"
-    echo "===================="
-    echo "Application: $APPLICATION_NAME"
-    echo "Environment: $ENVIRONMENT"
-    echo "Region: $AWS_REGION"
-    echo "Infrastructure Stack: $INFRA_STACK_NAME"
-    echo "Service Stack: $SERVICE_STACK_NAME"
-    echo ""
-    echo "Application URL: $ALB_URL"
-    echo "CodeCommit Repository: $CODECOMMIT_URL"
-    echo ""
-    print_success "Deployment completed successfully!"
-    echo ""
-    print_status "You can now:"
-    echo "1. Access your application at: $ALB_URL"
-    echo "2. Clone your CodeCommit repository: git clone $CODECOMMIT_URL"
-    echo "3. Monitor your ECS service in the AWS Console"
-    echo "4. View logs in CloudWatch: /ecs/${APPLICATION_NAME}-${ENVIRONMENT}"
-    echo ""
-    print_status "To update the application:"
-    echo "1. Make code changes"
-    echo "2. Run: ./deploy-fixed.sh --update-only"
-}
-
-# Function to setup CodeCommit repository
-setup_codecommit() {
-    print_status "Setting up CodeCommit repository..."
     
     # Check if git is initialized
-    if [ ! -d ".git" ]; then
+    if [[ ! -d ".git" ]]; then
+        print_status "Initializing git repository..."
         git init
-        print_success "Git repository initialized"
     fi
     
-    # Add CodeCommit as remote if not already added
-    if ! git remote get-url origin &> /dev/null; then
-        git remote add origin $CODECOMMIT_URL
-        print_success "CodeCommit remote added"
+    # Add CodeCommit as remote
+    if git remote get-url codecommit &> /dev/null; then
+        print_status "Updating CodeCommit remote..."
+        git remote set-url codecommit "$CODECOMMIT_URL"
     else
-        print_warning "Git remote 'origin' already exists"
+        print_status "Adding CodeCommit remote..."
+        git remote add codecommit "$CODECOMMIT_URL"
     fi
     
     # Create .gitignore if it doesn't exist
-    if [ ! -f ".gitignore" ]; then
-        cat > .gitignore << 'EOF'
+    if [[ ! -f ".gitignore" ]]; then
+        cat > .gitignore << EOF
 target/
 !.mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
@@ -320,134 +354,230 @@ build/
 .DS_Store
 Thumbs.db
 
-### Logs ###
-*.log
+### finch ###
+.finchignore
 EOF
-        print_success ".gitignore created"
     fi
     
-    print_status "To push your code to CodeCommit:"
-    echo "git add ."
-    echo "git commit -m 'Initial commit'"
-    echo "git push -u origin main"
+    print_success "CodeCommit integration setup complete"
+    print_status "CodeCommit URL: $CODECOMMIT_URL"
+    print_status "To push code: git push codecommit main"
 }
 
-# Function to update existing deployment
-update_deployment() {
-    print_status "Updating existing deployment..."
+# Function to check deployment status
+check_status() {
+    print_status "Checking deployment status..."
     
-    # Get existing outputs
-    get_infra_outputs
+    # Check infrastructure stack
+    if stack_exists "$INFRASTRUCTURE_STACK_NAME"; then
+        INFRA_STATUS=$(aws cloudformation describe-stacks \
+            --stack-name "$INFRASTRUCTURE_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query 'Stacks[0].StackStatus' \
+            --output text)
+        print_status "Infrastructure Stack: $INFRA_STATUS"
+        
+        if [[ "$INFRA_STATUS" == "CREATE_COMPLETE" || "$INFRA_STATUS" == "UPDATE_COMPLETE" ]]; then
+            # Get ALB URL
+            ALB_URL=$(aws cloudformation describe-stacks \
+                --stack-name "$INFRASTRUCTURE_STACK_NAME" \
+                --region "$AWS_REGION" \
+                --query 'Stacks[0].Outputs[?OutputKey==`ApplicationLoadBalancerURL`].OutputValue' \
+                --output text)
+            print_status "Application Load Balancer: $ALB_URL"
+        fi
+    else
+        print_warning "Infrastructure stack not found"
+    fi
     
-    # Build and push new image
-    build_application
+    # Check service stack
+    if stack_exists "$SERVICE_STACK_NAME"; then
+        SERVICE_STATUS=$(aws cloudformation describe-stacks \
+            --stack-name "$SERVICE_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query 'Stacks[0].StackStatus' \
+            --output text)
+        print_status "Service Stack: $SERVICE_STATUS"
+        
+        if [[ "$SERVICE_STATUS" == "CREATE_COMPLETE" || "$SERVICE_STATUS" == "UPDATE_COMPLETE" ]]; then
+            # Check ECS service status
+            ECS_SERVICE_STATUS=$(aws ecs describe-services \
+                --cluster "${PROJECT_NAME}-${ENVIRONMENT}-cluster" \
+                --services "${PROJECT_NAME}-${ENVIRONMENT}-service" \
+                --region "$AWS_REGION" \
+                --query 'services[0].status' \
+                --output text 2>/dev/null || echo "NOT_FOUND")
+            
+            if [[ "$ECS_SERVICE_STATUS" != "NOT_FOUND" ]]; then
+                print_status "ECS Service Status: $ECS_SERVICE_STATUS"
+                
+                # Get running task count
+                RUNNING_TASKS=$(aws ecs describe-services \
+                    --cluster "${PROJECT_NAME}-${ENVIRONMENT}-cluster" \
+                    --services "${PROJECT_NAME}-${ENVIRONMENT}-service" \
+                    --region "$AWS_REGION" \
+                    --query 'services[0].runningCount' \
+                    --output text)
+                
+                DESIRED_TASKS=$(aws ecs describe-services \
+                    --cluster "${PROJECT_NAME}-${ENVIRONMENT}-cluster" \
+                    --services "${PROJECT_NAME}-${ENVIRONMENT}-service" \
+                    --region "$AWS_REGION" \
+                    --query 'services[0].desiredCount' \
+                    --output text)
+                
+                print_status "Tasks: $RUNNING_TASKS/$DESIRED_TASKS running"
+                
+                if [[ "$RUNNING_TASKS" -eq "$DESIRED_TASKS" && "$RUNNING_TASKS" -gt 0 ]]; then
+                    print_success "Application is healthy and running!"
+                    if [[ -n "$ALB_URL" ]]; then
+                        print_status "Access your application at: $ALB_URL"
+                        print_status "Health check: $ALB_URL/actuator/health"
+                    fi
+                fi
+            fi
+        fi
+    else
+        print_warning "Service stack not found"
+    fi
+}
+
+# Function to cleanup resources
+cleanup() {
+    print_warning "This will delete ALL resources created by this deployment!"
+    read -p "Are you sure you want to continue? (yes/no): " -r
+    if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
+        print_status "Cleanup cancelled"
+        exit 0
+    fi
+    
+    print_status "Cleaning up resources..."
+    
+    # Delete service stack first
+    if stack_exists "$SERVICE_STACK_NAME"; then
+        print_status "Deleting service stack..."
+        aws cloudformation delete-stack \
+            --stack-name "$SERVICE_STACK_NAME" \
+            --region "$AWS_REGION"
+        wait_for_stack "$SERVICE_STACK_NAME" "delete"
+    fi
+    
+    # Delete infrastructure stack
+    if stack_exists "$INFRASTRUCTURE_STACK_NAME"; then
+        print_status "Deleting infrastructure stack..."
+        aws cloudformation delete-stack \
+            --stack-name "$INFRASTRUCTURE_STACK_NAME" \
+            --region "$AWS_REGION"
+        wait_for_stack "$INFRASTRUCTURE_STACK_NAME" "delete"
+    fi
+    
+    print_success "Cleanup completed"
+}
+
+# Function to perform full deployment
+full_deploy() {
+    print_status "Starting full deployment..."
+    check_prerequisites
+    deploy_infrastructure
     build_and_push_image
-    
-    # Update ECS service with new image
-    deploy_ecs_service
-    get_service_outputs
-    wait_for_service
-    
-    print_success "Deployment updated successfully!"
+    deploy_service
+    print_success "Full deployment completed!"
+    check_status
 }
 
-# Main execution
-main() {
-    echo "========================================="
-    echo "ToDo Manager ECS Deployment Script (Fixed)"
-    echo "========================================="
-    echo ""
+# Function to update deployment
+update_deployment() {
+    print_status "Updating deployment..."
+    check_prerequisites
     
-    # Parse command line arguments
-    DEPLOY_INFRA=true
-    BUILD_APP=true
-    PUSH_IMAGE=true
-    DEPLOY_SERVICE=true
-    UPDATE_ONLY=false
-    
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --skip-infra)
-                DEPLOY_INFRA=false
-                shift
-                ;;
-            --skip-build)
-                BUILD_APP=false
-                shift
-                ;;
-            --skip-push)
-                PUSH_IMAGE=false
-                shift
-                ;;
-            --skip-service)
-                DEPLOY_SERVICE=false
-                shift
-                ;;
-            --update-only)
-                UPDATE_ONLY=true
-                DEPLOY_INFRA=false
-                shift
-                ;;
-            --help)
-                echo "Usage: $0 [OPTIONS]"
-                echo ""
-                echo "Options:"
-                echo "  --skip-infra    Skip infrastructure deployment"
-                echo "  --skip-build    Skip application build"
-                echo "  --skip-push     Skip finch image push"
-                echo "  --skip-service  Skip ECS service deployment"
-                echo "  --update-only   Only update app (skip infrastructure)"
-                echo "  --help          Show this help message"
-                exit 0
-                ;;
-            *)
-                print_error "Unknown option: $1"
-                exit 1
-                ;;
-        esac
-    done
-    
-    # Pre-flight checks
-    check_aws_cli
-    check_finch
-    
-    if [ "$UPDATE_ONLY" = true ]; then
-        update_deployment
-        return
-    fi
-    
-    # Step 1: Deploy infrastructure (VPC, ECR, ALB, etc.)
-    if [ "$DEPLOY_INFRA" = true ]; then
+    # Update infrastructure if template changed
+    if [[ infrastructure-template.yaml -nt "$HOME/.aws-deploy-last-infra" ]]; then
+        print_status "Infrastructure template changed, updating..."
         deploy_infrastructure
+        touch "$HOME/.aws-deploy-last-infra"
     fi
     
-    # Get infrastructure outputs
-    get_infra_outputs
+    # Always build and push new image for updates
+    build_and_push_image
+    deploy_service
     
-    # Step 2: Build application
-    if [ "$BUILD_APP" = true ]; then
-        build_application
-        #create_finchfile
-    fi
-    
-    # Step 3: Build and push finch image
-    if [ "$PUSH_IMAGE" = true ]; then
-        build_and_push_image
-    fi
-    
-    # Step 4: Deploy ECS service (now that image exists)
-    if [ "$DEPLOY_SERVICE" = true ]; then
-        deploy_ecs_service
-        get_service_outputs
-        wait_for_service
-    fi
-    
-    # Setup CodeCommit
-    setup_codecommit
-    
-    # Show final status
-    show_deployment_status
+    print_success "Deployment updated!"
+    check_status
 }
 
-# Run main function
-main "$@"
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --infrastructure-only)
+            check_prerequisites
+            deploy_infrastructure
+            exit 0
+            ;;
+        --service-only)
+            check_prerequisites
+            deploy_service
+            exit 0
+            ;;
+        --app-only)
+            check_prerequisites
+            build_and_push_image
+            deploy_service
+            exit 0
+            ;;
+        --setup-git)
+            setup_git
+            exit 0
+            ;;
+        --full-deploy)
+            full_deploy
+            exit 0
+            ;;
+        --update)
+            update_deployment
+            exit 0
+            ;;
+        --cleanup)
+            cleanup
+            exit 0
+            ;;
+        --status)
+            check_status
+            exit 0
+            ;;
+        --project-name)
+            PROJECT_NAME="$2"
+            INFRASTRUCTURE_STACK_NAME="${PROJECT_NAME}-${ENVIRONMENT}-infrastructure"
+            SERVICE_STACK_NAME="${PROJECT_NAME}-${ENVIRONMENT}-service"
+            shift 2
+            ;;
+        --environment)
+            ENVIRONMENT="$2"
+            INFRASTRUCTURE_STACK_NAME="${PROJECT_NAME}-${ENVIRONMENT}-infrastructure"
+            SERVICE_STACK_NAME="${PROJECT_NAME}-${ENVIRONMENT}-service"
+            shift 2
+            ;;
+        --region)
+            AWS_REGION="$2"
+            shift 2
+            ;;
+        --image-tag)
+            IMAGE_TAG="$2"
+            shift 2
+            ;;
+        --help)
+            show_usage
+            exit 0
+            ;;
+        *)
+            print_error "Unknown option: $1"
+            show_usage
+            exit 1
+            ;;
+    esac
+done
+
+# If no arguments provided, show usage
+if [[ $# -eq 0 ]]; then
+    show_usage
+    exit 1
+fi

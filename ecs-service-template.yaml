@@ -1,11 +1,11 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'ECS Service template for ToDo Manager Spring Boot application'
+Description: 'ECS Service template for Spring Boot ToDo App - Task Definition and Service'
 
 Parameters:
-  ApplicationName:
+  ProjectName:
     Type: String
-    Default: todo-manager
-    Description: Name of the application
+    Default: todo-app
+    Description: Name of the project (used for resource naming)
   
   Environment:
     Type: String
@@ -13,126 +13,263 @@ Parameters:
     AllowedValues: [dev, staging, prod]
     Description: Environment name
   
-  ContainerPort:
-    Type: Number
-    Default: 8080
-    Description: Port on which the application runs
-  
-  DesiredCount:
-    Type: Number
-    Default: 2
-    Description: Number of tasks to run
-  
-  TaskCpu:
-    Type: String
-    Default: '512'
-    AllowedValues: ['256', '512', '1024', '2048', '4096']
-    Description: CPU units for the task
-  
-  TaskMemory:
-    Type: String
-    Default: '1024'
-    AllowedValues: ['512', '1024', '2048', '3072', '4096', '5120', '6144', '7168', '8192']
-    Description: Memory for the task
-
   ImageTag:
     Type: String
     Default: latest
     Description: Docker image tag to deploy
+  
+  DesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Desired number of ECS tasks
+  
+  ContainerCpu:
+    Type: Number
+    Default: 512
+    AllowedValues: [256, 512, 1024, 2048, 4096]
+    Description: CPU units for the container (1 vCPU = 1024 units)
+  
+  ContainerMemory:
+    Type: Number
+    Default: 1024
+    AllowedValues: [512, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192]
+    Description: Memory for the container in MB
+  
+  DatabaseUrl:
+    Type: String
+    Default: jdbc:h2:mem:todoapp;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    Description: Database connection URL
+  
+  DatabaseUsername:
+    Type: String
+    Default: sa
+    Description: Database username
+  
+  DatabasePassword:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Database password
 
 Resources:
   # ECS Task Definition
-  TaskDefinition:
+  ECSTaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Family: !Sub '${ApplicationName}-${Environment}'
-      Cpu: !Ref TaskCpu
-      Memory: !Ref TaskMemory
+      Family: !Sub ${ProjectName}-${Environment}-task
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
+      Cpu: !Ref ContainerCpu
+      Memory: !Ref ContainerMemory
       ExecutionRoleArn: 
-        Fn::ImportValue: !Sub '${ApplicationName}-${Environment}-ecs-execution-role'
-      TaskRoleArn: 
-        Fn::ImportValue: !Sub '${ApplicationName}-${Environment}-ecs-task-role'
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-ECS-TaskExecutionRole-ARN
+      TaskRoleArn:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-ECS-TaskRole-ARN
       ContainerDefinitions:
-        - Name: !Sub '${ApplicationName}-container'
-          Image: !Sub 
-            - '${ECRUri}:${ImageTag}'
-            - ECRUri: 
-                Fn::ImportValue: !Sub '${ApplicationName}-${Environment}-ecr-uri'
+        - Name: !Sub ${ProjectName}-container
+          Image: !Sub
+            - ${ECRRepository}:${ImageTag}
+            - ECRRepository:
+                Fn::ImportValue: !Sub ${ProjectName}-${Environment}-ECR-Repository-URI
               ImageTag: !Ref ImageTag
+          Essential: true
           PortMappings:
-            - ContainerPort: !Ref ContainerPort
+            - ContainerPort: 8080
               Protocol: tcp
           Environment:
             - Name: SPRING_PROFILES_ACTIVE
-              Value: prod
+              Value: dev
+            - Name: SPRING_DATASOURCE_URL
+              Value: !Ref DatabaseUrl
+            - Name: SPRING_DATASOURCE_USERNAME
+              Value: !Ref DatabaseUsername
+            - Name: SPRING_DATASOURCE_PASSWORD
+              Value: !Ref DatabasePassword
             - Name: SERVER_PORT
-              Value: !Ref ContainerPort
+              Value: "8080"
+            - Name: MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE
+              Value: health,info
+            - Name: MANAGEMENT_ENDPOINT_HEALTH_SHOW_DETAILS
+              Value: when-authorized
+            - Name: LOGGING_LEVEL_COM_EXAMPLE_TODOAPP
+              Value: INFO
+            - Name: SPRING_JPA_HIBERNATE_DDL_AUTO
+              Value: update
+            - Name: SPRING_JPA_SHOW_SQL
+              Value: "false"
           LogConfiguration:
             LogDriver: awslogs
             Options:
-              awslogs-group: 
-                Fn::ImportValue: !Sub '${ApplicationName}-${Environment}-log-group'
+              awslogs-group:
+                Fn::ImportValue: !Sub ${ProjectName}-${Environment}-CloudWatch-LogGroup-Name
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: ecs
-          Essential: true
           HealthCheck:
             Command:
               - CMD-SHELL
-              - !Sub 'curl -f http://localhost:${ContainerPort}/actuator/health || exit 1'
+              - "curl -f http://localhost:8080/actuator/health || exit 1"
             Interval: 30
             Timeout: 5
             Retries: 3
             StartPeriod: 60
+          StopTimeout: 30
       Tags:
         - Key: Name
-          Value: !Sub '${ApplicationName}-${Environment}-task-definition'
+          Value: !Sub ${ProjectName}-${Environment}-task-definition
+        - Key: Project
+          Value: !Ref ProjectName
 
   # ECS Service
   ECSService:
     Type: AWS::ECS::Service
     Properties:
-      ServiceName: !Sub '${ApplicationName}-${Environment}-service'
-      Cluster: 
-        Fn::ImportValue: !Sub '${ApplicationName}-${Environment}-ecs-cluster'
-      TaskDefinition: !Ref TaskDefinition
+      ServiceName: !Sub ${ProjectName}-${Environment}-service
+      Cluster:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-ECS-Cluster-Name
+      TaskDefinition: !Ref ECSTaskDefinition
       DesiredCount: !Ref DesiredCount
       LaunchType: FARGATE
+      PlatformVersion: LATEST
       NetworkConfiguration:
         AwsvpcConfiguration:
-          SecurityGroups:
-            - Fn::ImportValue: !Sub '${ApplicationName}-${Environment}-ecs-security-group'
-          Subnets: !Split
-            - ','
-            - Fn::ImportValue: !Sub '${ApplicationName}-${Environment}-private-subnets'
           AssignPublicIp: DISABLED
+          SecurityGroups:
+            - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-ECS-SecurityGroup-ID
+          Subnets:
+            - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-PrivateSubnet1-ID
+            - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-PrivateSubnet2-ID
       LoadBalancers:
-        - ContainerName: !Sub '${ApplicationName}-container'
-          ContainerPort: !Ref ContainerPort
-          TargetGroupArn: 
-            Fn::ImportValue: !Sub '${ApplicationName}-${Environment}-alb-target-group'
+        - ContainerName: !Sub ${ProjectName}-container
+          ContainerPort: 8080
+          TargetGroupArn:
+            Fn::ImportValue: !Sub ${ProjectName}-${Environment}-ALB-TargetGroup-ARN
+      HealthCheckGracePeriodSeconds: 120
       DeploymentConfiguration:
         MaximumPercent: 200
         MinimumHealthyPercent: 50
         DeploymentCircuitBreaker:
           Enable: true
           Rollback: true
-      HealthCheckGracePeriodSeconds: 120
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
       Tags:
         - Key: Name
-          Value: !Sub '${ApplicationName}-${Environment}-service'
+          Value: !Sub ${ProjectName}-${Environment}-service
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Auto Scaling Target
+  ECSServiceScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 10
+      MinCapacity: 1
+      ResourceId: !Sub service/${ProjectName}-${Environment}-cluster/${ProjectName}-${Environment}-service
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+    DependsOn: ECSService
+
+  # Auto Scaling Policy - CPU
+  ECSServiceScalingPolicyCPU:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-${Environment}-cpu-scaling-policy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ECSServiceScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 70.0
+        ScaleOutCooldown: 300
+        ScaleInCooldown: 300
+
+  # Auto Scaling Policy - Memory
+  ECSServiceScalingPolicyMemory:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-${Environment}-memory-scaling-policy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ECSServiceScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageMemoryUtilization
+        TargetValue: 80.0
+        ScaleOutCooldown: 300
+        ScaleInCooldown: 300
+
+  # CloudWatch Alarms
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-high-cpu
+      AlarmDescription: High CPU utilization alarm
+      MetricName: CPUUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !Sub ${ProjectName}-${Environment}-service
+        - Name: ClusterName
+          Value: !Sub ${ProjectName}-${Environment}-cluster
+      TreatMissingData: notBreaching
+
+  HighMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-high-memory
+      AlarmDescription: High memory utilization alarm
+      MetricName: MemoryUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !Sub ${ProjectName}-${Environment}-service
+        - Name: ClusterName
+          Value: !Sub ${ProjectName}-${Environment}-cluster
+      TreatMissingData: notBreaching
+
+  ServiceUnhealthyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-service-unhealthy
+      AlarmDescription: Service has unhealthy tasks
+      MetricName: RunningTaskCount
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !Sub ${ProjectName}-${Environment}-service
+        - Name: ClusterName
+          Value: !Sub ${ProjectName}-${Environment}-cluster
+      TreatMissingData: breaching
 
 Outputs:
   ECSServiceName:
-    Description: ECS Service name
-    Value: !GetAtt ECSService.Name
+    Description: ECS Service Name
+    Value: !Ref ECSService
     Export:
-      Name: !Sub '${ApplicationName}-${Environment}-ecs-service'
+      Name: !Sub ${ProjectName}-${Environment}-ECS-Service-Name
 
-  TaskDefinitionArn:
-    Description: Task Definition ARN
-    Value: !Ref TaskDefinition
+  ECSTaskDefinitionArn:
+    Description: ECS Task Definition ARN
+    Value: !Ref ECSTaskDefinition
     Export:
-      Name: !Sub '${ApplicationName}-${Environment}-task-definition'
+      Name: !Sub ${ProjectName}-${Environment}-ECS-TaskDefinition-ARN
+
+  
